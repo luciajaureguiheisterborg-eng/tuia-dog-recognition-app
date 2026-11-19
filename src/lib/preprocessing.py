@@ -32,3 +32,20 @@ class PadToSquare:
         lado = max(w, h)
         lienzo = Image.new("RGB", (lado, lado), self.fill)
         lienzo.paste(img, ((lado - w) // 2, (lado - h) // 2))
+        return lienzo
+
+
+def eval_transform(size: int | None = None) -> T.Compose:
+    """Transformación para valid, test, conjunto independiente y la app."""
+    size = int(size or settings.image_size)
+    return T.Compose([
+        PadToSquare(),
+        T.Resize((size, size)),
+        T.ToTensor(),
+        T.Normalize(IMAGENET_MEAN, IMAGENET_STD),
+    ])
+
+
+def preprocess_bgr(image: np.ndarray) -> torch.Tensor:
+    """Imagen BGR de OpenCV -> tensor (1, 3, H, W) listo para el modelo."""
+    return eval_transform()(bgr_to_pil(image)).unsqueeze(0)
