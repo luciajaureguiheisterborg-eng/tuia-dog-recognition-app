@@ -7,7 +7,9 @@ from uuid import uuid4
 
 import cv2
 import numpy as np
+import torch
 
+from lib.preprocessing import bgr_to_pil, eval_transform
 from lib.schemas import ClassifyResult, DetectResult, DogDetection
 from lib.services.classifier_service import ClassifierService
 
@@ -62,6 +64,17 @@ class DetectionService:
     # Etapa 3: funciones a implementar
     # ------------------------------------------------------------------
 
+    def _get_detector(self):
+        """Carga YOLO una sola vez (lazy) y lo reutiliza en las siguientes llamadas."""
+        detector = getattr(self, "_detector", None)
+        if detector is None:
+            from ultralytics import YOLO  # import tardio: solo hace falta en la Etapa 3
+
+            logger.info("Loading YOLO detector: %s", self.yolo_model_name)
+            detector = YOLO(self.yolo_model_name)
+            self._detector = detector
+        return detector
+
     def detect_dogs(self, image: np.ndarray) -> list[tuple[tuple[int, int, int, int], float]]:
         """
         Detecta todos los perros presentes en la imagen usando un modelo YOLO
@@ -75,7 +88,26 @@ class DetectionService:
 
         Retorna una lista de ((x1, y1, x2, y2), confidence) en pixeles.
         """
-        raise NotImplementedError("Etapa 3: implementar detect_dogs")
+        if image is None or image.size == 0:
+            return []
+        # ultralytics interpreta un np.ndarray como BGR (igual que cv2.imread).
+        results = self._get_detector().predict(
+            image,
+            conf=self.conf_threshold,
+            classes=[self.dog_class_id],
+            verbose=False,
+        )
+        detections: list[tuple[tuple[int, int, int, int], float]] = []
+        for result in results:
+            if result.boxes is None:
+                continue
+            for box in result.boxes:
+                if int(box.cls[0]) != self.dog_class_id:
+                    continue
+                x1, y1, x2, y2 = (int(round(v)) for v in box.xyxy[0].tolist())
+                detections.append(((x1, y1, x2, y2), float(box.conf[0])))
+        detections.sort(key=lambda d: d[1], reverse=True)
+        return detections
 
     def classify_detected_dog(self, crop: np.ndarray) -> tuple[str, float]:
         """
@@ -84,7 +116,38 @@ class DetectionService:
 
         El recorte llega en BGR (OpenCV). Retorna (raza, score).
         """
-        raise NotImplementedError("Etapa 3: implementar classify_detected_dog")
+        if crop is None or crop.size == 0:
+            return "unknown", 0.0
+
+        model = self.classifier.load_model()
+        # Mismo pipeline que valid/test: (1, 3, H, W)
+        tensor = eval_transform(self.classifier.image_size)(bgr_to_pil(crop)).unsqueeze(0)
+
+        if isinstance(model, torch.nn.Module):
+            model.eval()
+            with torch.no_grad():
+                logits = model(tensor)
+                probs = torch.softmax(logits, dim=1)[0]
+            idx = int(torch.argmax(probs))
+            score = float(probs[idx])
+            classes = getattr(model, "classes", None)
+        else:  # onnxruntime.InferenceSession
+            batch = tensor.numpy().astype(np.float32)
+            input_name = model.get_inputs()[0].name
+            logits = model.run(None, {input_name: batch})[0][0]
+            exp = np.exp(logits - logits.max())
+            probs = exp / exp.sum()
+            idx = int(np.argmax(probs))
+            score = float(probs[idx])
+            meta = model.get_modelmeta().custom_metadata_map
+            classes = json.loads(meta["classes"]) if "classes" in meta else None
+
+        if not classes:
+            raise ValueError(
+                "El checkpoint no trae la lista de razas ('classes'). "
+                "Guardala junto con el modelo al entrenar."
+            )
+        return str(classes[idx]), score
 
     # ------------------------------------------------------------------
     # Orquestacion provista
