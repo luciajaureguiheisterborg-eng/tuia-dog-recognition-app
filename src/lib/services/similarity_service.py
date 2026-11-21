@@ -11,7 +11,7 @@ import cv2
 import numpy as np
 import torch
 
-from lib.preprocessing import l2_normalize, to_batch_tensor
+from lib.preprocessing import bgr_to_pil, eval_transform
 from lib.schemas import EmbeddingRecord, Neighbor, SearchResult
 from lib.storage.base import EmbeddingStoreProtocol
 
@@ -91,11 +91,12 @@ class SimilarityService:
           - Recordar que la imagen llega en BGR (OpenCV).
         Retorna una lista de floats de dimension EMBEDDING_DIM.
         """
-        tensor = to_batch_tensor(image, self.image_size)  # BGR->RGB, resize, normalizacion
+           # Mismo pipeline que valid/test/app: BGR->RGB, padding cuadrado, resize, normalizacion ImageNet
+        tensor = eval_transform(self.image_size)(bgr_to_pil(image)).unsqueeze(0)
         with torch.no_grad():
             emb = self._get_backbone()(tensor)[0].numpy().astype(np.float64)
-        return l2_normalize(emb).tolist()
-
+        norm = float(np.linalg.norm(emb))
+        return (emb / norm if norm > 0 else emb).tolist()  # norma 1: coseno = producto punto
     def search_similar_images(self, embedding: list[float], top_k: int) -> list[Neighbor]:
         """
         Recupera de la base vectorial las top_k imagenes mas similares.
