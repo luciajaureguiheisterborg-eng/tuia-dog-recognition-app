@@ -2,217 +2,257 @@ from __future__ import annotations
 
 import json
 import logging
+from collections import defaultdict
 from pathlib import Path
+from typing import Callable, Optional
 from uuid import uuid4
 
 import cv2
 import numpy as np
 import torch
 
-from lib.preprocessing import bgr_to_pil, eval_transform
-from lib.schemas import ClassifyResult, DetectResult, DogDetection
-from lib.services.classifier_service import ClassifierService
+from lib.preprocessing import l2_normalize, to_batch_tensor
+from lib.schemas import EmbeddingRecord, Neighbor, SearchResult
+from lib.storage.base import EmbeddingStoreProtocol
 
 logger = logging.getLogger(__name__)
 
 
-class DetectionService:
-    """Etapa 3: pipeline de deteccion y clasificacion.
+class SimilarityService:
+    """Etapa 1: buscador de imagenes por similitud.
 
     Funciones a implementar por el estudiante:
-      - detect_dogs(image)
-      - classify_detected_dog(crop)
+      - extract_embedding(image)
+      - search_similar_images(embedding, top_k)
+      - predict_breed_from_neighbors(results)
 
-    La orquestacion (predict: deteccion -> recorte -> clasificacion -> JSON)
-    ya esta provista.
+    La orquestacion (search, index_image, persistencia y metricas de similitud)
+    ya esta provista y no debe modificarse sin justificarlo en el Pull Request.
     """
 
     def __init__(
         self,
-        classifier: ClassifierService,
-        yolo_model: str,
-        conf_threshold: float,
-        dog_class_id: int,
+        store: EmbeddingStoreProtocol,
+        similarity_metric: str,
+        similarity_threshold: float,
+        top_k: int,
+        image_size: int,
+        model_name: str,
+        url_resolver: Optional[Callable[[Path], Optional[str]]] = None,
+        data_root: Optional[Path] = None,
     ) -> None:
-        self.classifier = classifier
-        self.yolo_model_name = yolo_model
-        self.conf_threshold = conf_threshold
-        self.dog_class_id = dog_class_id
-
-    @staticmethod
-    def _clip_xyxy(
-        x1: int, y1: int, x2: int, y2: int, height: int, width: int
-    ) -> tuple[int, int, int, int]:
-        x1 = max(0, min(x1, width - 1))
-        x2 = max(0, min(x2, width))
-        y1 = max(0, min(y1, height - 1))
-        y2 = max(0, min(y2, height))
-        if x2 <= x1:
-            x2 = min(x1 + 1, width)
-        if y2 <= y1:
-            y2 = min(y1 + 1, height)
-        return x1, y1, x2, y2
+        self.store = store
+        self.similarity_metric = similarity_metric
+        self.similarity_threshold = similarity_threshold
+        self.top_k = top_k
+        self.image_size = image_size
+        self.model_name = model_name
+        self.url_resolver = url_resolver
+        # DATA_PATH: las rutas de la galeria se guardan relativas a esta carpeta para que
+        # la base indexada desde el entorno local sirva tambien en Docker (y viceversa).
+        self.data_root = data_root
 
     def _load_image(self, source_path: str) -> np.ndarray:
         image = cv2.imread(str(source_path))
         if image is None:
             raise ValueError(f"Could not read image: {source_path}")
-        # BGR uint8 (convencion OpenCV / ultralytics)
+        # BGR uint8 (convencion OpenCV)
         return image
 
     # ------------------------------------------------------------------
-    # Etapa 3: funciones a implementar
+    # Etapa 1: funciones a implementar
     # ------------------------------------------------------------------
 
-    def _get_detector(self):
-        """Carga YOLO una sola vez (lazy) y lo reutiliza en las siguientes llamadas."""
-        detector = getattr(self, "_detector", None)
-        if detector is None:
-            from ultralytics import YOLO  # import tardio: solo hace falta en la Etapa 3
+    def _get_backbone(self) -> torch.nn.Module:
+        """ResNet18 preentrenada en ImageNet sin la capa final (embedding de 512 dims).
 
-            logger.info("Loading YOLO detector: %s", self.yolo_model_name)
-            detector = YOLO(self.yolo_model_name)
-            self._detector = detector
-        return detector
-
-    def detect_dogs(self, image: np.ndarray) -> list[tuple[tuple[int, int, int, int], float]]:
+        Se carga una sola vez (lazy) y se reutiliza en las siguientes llamadas.
         """
-        Detecta todos los perros presentes en la imagen usando un modelo YOLO
-        pre-entrenado (ej: YOLOv8n via ultralytics). No es necesario entrenar
-        el detector.
+        backbone = getattr(self, "_backbone", None)
+        if backbone is None:
+            from torchvision.models import ResNet18_Weights, resnet18
+
+            logger.info("Loading baseline embedding model: ResNet18 (ImageNet)")
+            backbone = resnet18(weights=ResNet18_Weights.IMAGENET1K_V1)
+            backbone.fc = torch.nn.Identity()  # sin clasificador: sale el vector de 512
+            backbone.eval()
+            self._backbone = backbone
+        return backbone
+
+    def extract_embedding(self, image: np.ndarray) -> list[float]:
+        """
+        Genera el embedding de una imagen usando un modelo pre-entrenado en
+        ImageNet (ej: ResNet50, EfficientNet, ConvNeXt) sin la capa de
+        clasificacion final.
 
         Sugerencias:
-          - self.yolo_model_name, self.conf_threshold y self.dog_class_id
-            (clase 'dog' = 16 en COCO) vienen de la configuracion (.env).
-          - Debe funcionar con un perro, multiples perros y escenas complejas.
-
-        Retorna una lista de ((x1, y1, x2, y2), confidence) en pixeles.
+          - Preprocesar la imagen (resize a self.image_size, normalizacion ImageNet).
+          - Usar torchvision.models o timm con pesos pre-entrenados.
+          - Recordar que la imagen llega en BGR (OpenCV).
+        Retorna una lista de floats de dimension EMBEDDING_DIM.
         """
-        if image is None or image.size == 0:
+        tensor = to_batch_tensor(image, self.image_size)  # BGR->RGB, resize, normalizacion
+        with torch.no_grad():
+            emb = self._get_backbone()(tensor)[0].numpy().astype(np.float64)
+        return l2_normalize(emb).tolist()
+
+    def search_similar_images(self, embedding: list[float], top_k: int) -> list[Neighbor]:
+        """
+        Recupera de la base vectorial las top_k imagenes mas similares.
+
+        Sugerencias:
+          - Con pgvector: self.store.search(embedding, top_k).
+          - Con JSON: iterar self.store.all() y usar self.similarity(...).
+          - Respetar SIMILARITY_METRIC (cosine | l2).
+        Retorna una lista de Neighbor (path, breed, score) ordenada por score
+        descendente.
+        """
+        if top_k <= 0:
             return []
-        # ultralytics interpreta un np.ndarray como BGR (igual que cv2.imread).
-        results = self._get_detector().predict(
-            image,
-            conf=self.conf_threshold,
-            classes=[self.dog_class_id],
-            verbose=False,
-        )
-        detections: list[tuple[tuple[int, int, int, int], float]] = []
-        for result in results:
-            if result.boxes is None:
-                continue
-            for box in result.boxes:
-                if int(box.cls[0]) != self.dog_class_id:
-                    continue
-                x1, y1, x2, y2 = (int(round(v)) for v in box.xyxy[0].tolist())
-                detections.append(((x1, y1, x2, y2), float(box.conf[0])))
-        detections.sort(key=lambda d: d[1], reverse=True)
-        return detections
+        use_db_search = hasattr(self.store, "search") and self.similarity_metric.lower() == "cosine"
+        if use_db_search:
+            # pgvector ordena por distancia coseno en la base (operador <=>).
+            records = self.store.search(embedding, top_k)
+        else:
+            # JSON, o metrica l2 (la base ordena solo por coseno): se recorren todos los registros.
+            records = self.store.all()
 
-    def classify_detected_dog(self, crop: np.ndarray) -> tuple[str, float]:
-        """
-        Clasifica la raza del recorte de un perro detectado usando el modelo
-        entrenado en la Etapa 2 (self.classifier.load_model()).
+        neighbors = [
+            Neighbor(
+                path=rec.path,
+                breed=rec.breed,
+                score=self.similarity(embedding, rec.embedding),
+            )
+            for rec in records
+        ]
+        neighbors.sort(key=lambda n: n.score, reverse=True)
+        return neighbors[:top_k]
 
-        El recorte llega en BGR (OpenCV). Retorna (raza, score).
+    def predict_breed_from_neighbors(self, results: list[Neighbor]) -> tuple[str, float]:
         """
-        if crop is None or crop.size == 0:
+        Predice la raza a partir de los vecinos recuperados (ej: voto
+        mayoritario, opcionalmente ponderado por score).
+
+        Si el mejor score esta por debajo de self.similarity_threshold se
+        considera "unknown". Retorna (raza, score).
+        """
+        if not results:
             return "unknown", 0.0
 
-        model = self.classifier.load_model()
-        # Mismo pipeline que valid/test: (1, 3, H, W)
-        tensor = eval_transform(self.classifier.image_size)(bgr_to_pil(crop)).unsqueeze(0)
+        # Si ni el vecino mas parecido supera el umbral, no hay evidencia suficiente.
+        best_score = max(n.score for n in results)
+        if best_score < self.similarity_threshold:
+            return "unknown", float(best_score)
 
-        if isinstance(model, torch.nn.Module):
-            model.eval()
-            with torch.no_grad():
-                logits = model(tensor)
-                probs = torch.softmax(logits, dim=1)[0]
-            idx = int(torch.argmax(probs))
-            score = float(probs[idx])
-            classes = getattr(model, "classes", None)
-        else:  # onnxruntime.InferenceSession
-            batch = tensor.numpy().astype(np.float32)
-            input_name = model.get_inputs()[0].name
-            logits = model.run(None, {input_name: batch})[0][0]
-            exp = np.exp(logits - logits.max())
-            probs = exp / exp.sum()
-            idx = int(np.argmax(probs))
-            score = float(probs[idx])
-            meta = model.get_modelmeta().custom_metadata_map
-            classes = json.loads(meta["classes"]) if "classes" in meta else None
+        # Voto ponderado: cada vecino suma su score a su raza.
+        votes: dict[str, float] = defaultdict(float)
+        scores_by_breed: dict[str, list[float]] = defaultdict(list)
+        for n in results:
+            votes[n.breed] += n.score
+            scores_by_breed[n.breed].append(n.score)
+        winner = max(votes, key=votes.get)
+        # Score devuelto: similitud media de los vecinos de la raza ganadora.
+        return winner, float(np.mean(scores_by_breed[winner]))
 
-        if not classes:
-            raise ValueError(
-                "El checkpoint no trae la lista de razas ('classes'). "
-                "Guardala junto con el modelo al entrenar."
-            )
-        return str(classes[idx]), score
+    # ------------------------------------------------------------------
+    # Helpers de similitud provistos
+    # ------------------------------------------------------------------
+
+    def _cosine(self, a: np.ndarray, b: np.ndarray) -> float:
+        denom = np.linalg.norm(a) * np.linalg.norm(b)
+        if denom == 0:
+            return 0.0
+        return float(np.dot(a, b) / denom)
+
+    def _l2_similarity(self, a: np.ndarray, b: np.ndarray) -> float:
+        dist = float(np.linalg.norm(a - b))
+        return 1.0 / (1.0 + dist)
+
+    def similarity(self, query: list[float], ref: list[float]) -> float:
+        a = np.asarray(query, dtype=np.float32)
+        b = np.asarray(ref, dtype=np.float32)
+        if self.similarity_metric.lower() == "l2":
+            return self._l2_similarity(a, b)
+        return self._cosine(a, b)
 
     # ------------------------------------------------------------------
     # Orquestacion provista
     # ------------------------------------------------------------------
 
-    def classify_image(
-        self, source_path: str, output_path: Path, model_name: str | None = None
-    ) -> str:
-        """Clasifica la imagen completa con el modelo entrenado (pestaña Etapa 2).
-
-        Reutiliza classify_detected_dog tratando la imagen entera como recorte,
-        por lo que requiere la Etapa 2 (modelo entrenado) y classify_detected_dog.
-        Escribe el resultado como JSON en `output_path` y retorna su ruta.
-        """
-        image = self._load_image(source_path)
-        # El modelo elegido vale solo para esta clasificacion: se restaura el activo para
-        # que /detect siga usando el modelo configurado.
-        previous = self.classifier.active_model_name
-        if model_name:
-            self.classifier.set_active_model(model_name)
+    def _to_stored_path(self, image_path: str) -> str:
+        """Ruta relativa a DATA_PATH si la imagen esta dentro; si no, la ruta tal cual."""
+        if self.data_root is None:
+            return str(image_path)
         try:
-            breed, score = self.classify_detected_dog(image)
-        finally:
-            self.classifier.set_active_model(previous)
-        payload = ClassifyResult(
-            source_path=source_path,
-            model=model_name or self.classifier.active_model_name,
+            return Path(image_path).resolve().relative_to(self.data_root.resolve()).as_posix()
+        except ValueError:
+            return str(image_path)
+
+    def resolve_path(self, stored_path: str) -> Path:
+        """Inversa de _to_stored_path: ruta local de una imagen guardada en la base."""
+        path = Path(stored_path)
+        if self.data_root is None or path.is_absolute():
+            return path
+        candidate = self.data_root / path
+        if not candidate.exists() and path.exists():
+            # Base indexada antes de guardar rutas relativas a DATA_PATH.
+            return path
+        return candidate
+
+    def index_image(
+        self, image_path: str, breed: str, metadata: dict[str, object] | None = None
+    ) -> EmbeddingRecord:
+        """Extrae el embedding de una imagen del dataset y lo persiste en la base vectorial.
+
+        La ruta se guarda relativa a DATA_PATH (ej: dataset/train/<raza>/<imagen>.jpg).
+        Para leer la imagen a partir de un registro, usar resolve_path(record.path).
+        """
+        image = self._load_image(image_path)
+        embedding = self.extract_embedding(image)
+        record = EmbeddingRecord(
+            id_imagen=str(uuid4()),
+            embedding=embedding,
+            path=self._to_stored_path(image_path),
             breed=breed,
-            score=round(float(score), 4),
+            metadata=metadata or {},
         )
-        output_path.mkdir(parents=True, exist_ok=True)
-        result_file = output_path / f"result-{uuid4()}.json"
-        result_file.write_text(
-            json.dumps(payload.model_dump(), ensure_ascii=True, indent=2),
-            encoding="utf-8",
-        )
-        return str(result_file)
+        self.store.append(record)
+        return record
 
-    def predict(self, source_path: str, output_path: Path) -> str:
-        """Flujo completo: deteccion -> bounding boxes -> recortes -> clasificacion.
+    def _with_url(self, neighbor: Neighbor) -> Neighbor:
+        if self.url_resolver is not None and not neighbor.url:
+            neighbor.url = self.url_resolver(self.resolve_path(neighbor.path))
+        return neighbor
 
+    def search(
+        self,
+        source_path: str,
+        output_path: Path,
+        embedding_fn: Optional[Callable[[np.ndarray], list[float]]] = None,
+        model_name: Optional[str] = None,
+        top_k: Optional[int] = None,
+    ) -> str:
+        """Pipeline completo de la Etapa 1: embedding -> vecinos -> raza predicha.
+
+        `embedding_fn` permite seleccionar dinamicamente el extractor
+        (baseline, resnet18_finetuned o cnn_custom, ver Etapa 2).
         Escribe el resultado como JSON en `output_path` y retorna su ruta.
         """
         image = self._load_image(source_path)
-        height, width = image.shape[:2]
+        extractor = embedding_fn or self.extract_embedding
+        embedding = extractor(image)
 
-        detections: list[DogDetection] = []
-        for (box, det_score) in self.detect_dogs(image):
-            x1, y1, x2, y2 = self._clip_xyxy(*[int(v) for v in box], height, width)
-            crop = image[y1:y2, x1:x2]
-            breed, breed_score = self.classify_detected_dog(crop)
-            detections.append(
-                DogDetection(
-                    bbox=[x1, y1, x2, y2],
-                    det_score=round(float(det_score), 4),
-                    breed=breed,
-                    breed_score=round(float(breed_score), 4),
-                )
-            )
+        k = int(top_k) if top_k else self.top_k
+        neighbors = [self._with_url(n) for n in self.search_similar_images(embedding, k)]
+        breed, score = self.predict_breed_from_neighbors(neighbors)
+        logger.info("Predicted breed: %s (score=%.4f) for %s", breed, score, source_path)
 
-        detected_breeds = sorted({item.breed for item in detections if item.breed != "unknown"})
-        payload = DetectResult(
+        payload = SearchResult(
             source_path=source_path,
-            detections=detections,
-            detected_breeds=detected_breeds,
+            model=model_name or self.model_name,
+            predicted_breed=breed,
+            score=round(float(score), 4),
+            neighbors=neighbors,
         )
         output_path.mkdir(parents=True, exist_ok=True)
         result_file = output_path / f"result-{uuid4()}.json"
