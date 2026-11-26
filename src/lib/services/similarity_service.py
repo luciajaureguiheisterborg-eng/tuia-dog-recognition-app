@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 class SimilarityService:
     """Etapa 1: buscador de imagenes por similitud.
 
-    Funciones a implementar por el estudiante:
+    Funciones a implementadas:
       - extract_embedding(image)
       - search_similar_images(embedding, top_k)
       - predict_breed_from_neighbors(results)
@@ -60,7 +60,7 @@ class SimilarityService:
         return image
 
     # ------------------------------------------------------------------
-    # Etapa 1: funciones a implementar
+    # Etapa 1: funciones 
     # ------------------------------------------------------------------
 
     def _get_backbone(self) -> torch.nn.Module:
@@ -82,14 +82,8 @@ class SimilarityService:
     def extract_embedding(self, image: np.ndarray) -> list[float]:
         """
         Genera el embedding de una imagen usando un modelo pre-entrenado en
-        ImageNet (ej: ResNet50, EfficientNet, ConvNeXt) sin la capa de
-        clasificacion final.
+        ImageNet (ResNet) sin la capa de clasificacion final.
 
-        Sugerencias:
-          - Preprocesar la imagen (resize a self.image_size, normalizacion ImageNet).
-          - Usar torchvision.models o timm con pesos pre-entrenados.
-          - Recordar que la imagen llega en BGR (OpenCV).
-        Retorna una lista de floats de dimension EMBEDDING_DIM.
         """
            # Mismo pipeline que valid/test/app: BGR->RGB, padding cuadrado, resize, normalizacion ImageNet
         tensor = eval_transform(self.image_size)(bgr_to_pil(image)).unsqueeze(0)
@@ -97,16 +91,10 @@ class SimilarityService:
             emb = self._get_backbone()(tensor)[0].numpy().astype(np.float64)
         norm = float(np.linalg.norm(emb))
         return (emb / norm if norm > 0 else emb).tolist()  # norma 1: coseno = producto punto
+    
     def search_similar_images(self, embedding: list[float], top_k: int) -> list[Neighbor]:
         """
         Recupera de la base vectorial las top_k imagenes mas similares.
-
-        Sugerencias:
-          - Con pgvector: self.store.search(embedding, top_k).
-          - Con JSON: iterar self.store.all() y usar self.similarity(...).
-          - Respetar SIMILARITY_METRIC (cosine | l2).
-        Retorna una lista de Neighbor (path, breed, score) ordenada por score
-        descendente.
         """
         if top_k <= 0:
             return []

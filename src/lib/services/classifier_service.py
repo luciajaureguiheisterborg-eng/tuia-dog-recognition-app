@@ -73,7 +73,7 @@ class BreedDataset(Dataset):
 class ClassifierService:
     """Etapa 2: entrenamiento y comparacion de modelos de clasificacion.
 
-    Funciones a implementar por el estudiante:
+    Funciones a implementadas:
       - train_classifier()
       - evaluate_classifier()
       - extract_custom_embedding(image)
@@ -218,7 +218,7 @@ class ClassifierService:
         """
         Entrena el clasificador de razas sobre el dataset (self.dataset_path).
 
-        Modelo A (obligatorio): fine-tuning de ResNet18 (o ResNet50) pre-entrenado.
+        Modelo A (obligatorio): fine-tuning de ResNet18 pre-entrenado.
         Modelo B (obligatorio): CNN propia.
 
         Debe:
