@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 class DetectionService:
     """Etapa 3: pipeline de deteccion y clasificacion.
 
-    Funciones a implementar por el estudiante:
+    Funciones implementadas:
       - detect_dogs(image)
       - classify_detected_dog(crop)
 
